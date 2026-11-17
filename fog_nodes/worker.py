@@ -2,6 +2,7 @@ from fastapi import FastAPI
 import psutil
 import platform
 import time
+from pydantic import BaseModel
 import requests
 import threading
 
@@ -22,7 +23,15 @@ CLOUD_NODE_URL = os.getenv(
 )
 
 HEARTBEAT_INTERVAL = 5
+RESOURCE_INTERVAL = 10
 START_TIME = time.time()
+CLOUD_HEARTBEAT_TIMEOUT = 15
+LAST_CLOUD_HEARTBEAT = None
+
+class CloudHeartbeat(BaseModel):
+    cloud_id: str
+    timestamp: float
+    status: str
 
 
 @app.get("/")
@@ -52,6 +61,54 @@ def resources():
         )
     }
 
+def get_cpu_temperature():
+
+    try:
+        temperatures = psutil.sensors_temperatures()
+
+        for sensor_list in temperatures.values():
+            for sensor in sensor_list:
+                if sensor.current is not None:
+                    return sensor.current
+
+    except (AttributeError, OSError):
+        pass
+
+    return None
+
+def send_resources():
+
+    while True:
+        start_time = time.time()
+
+        try:
+            resource_data = {
+                "node_id": NODE_ID,
+                "timestamp": time.time(),
+                "cpu_percent": psutil.cpu_percent(interval=1),
+                "ram_percent": psutil.virtual_memory().percent,
+                "ram_available_mb": round(
+                    psutil.virtual_memory().available / (1024 * 1024), 2
+                ),
+                "cpu_temperature_c": get_cpu_temperature()
+            }
+
+            response = requests.post(
+                f"{CLOUD_NODE_URL}/resources-report",
+                json=resource_data,
+                timeout=5
+            )
+
+            response.raise_for_status()
+
+            print(f"[RESOURCES] Sent to Cloud: {resource_data}")
+
+        except requests.RequestException as error:
+            print(f"[RESOURCES ERROR] {error}")
+
+        elapsed = time.time() - start_time
+        time.sleep(max(0, RESOURCE_INTERVAL - elapsed))
+
 def send_heartbeat():
 
     while True:
@@ -76,9 +133,47 @@ def send_heartbeat():
 @app.on_event("startup")
 def startup_event():
 
-    thread = threading.Thread(
+    heartbeat_thread = threading.Thread(
         target=send_heartbeat,
         daemon=True
     )
+    heartbeat_thread.start()
 
-    thread.start()
+    resource_thread = threading.Thread(
+        target=send_resources,
+        daemon=True
+    )
+    resource_thread.start()
+
+
+@app.post("/cloud-heartbeat")
+def receive_cloud_heartbeat(heartbeat: CloudHeartbeat):
+
+    global LAST_CLOUD_HEARTBEAT
+
+    LAST_CLOUD_HEARTBEAT = time.time()
+
+    print(f"[CLOUD HEARTBEAT] Received from {heartbeat.cloud_id}")
+
+    return {
+        "message": "Cloud heartbeat received",
+        "status": "alive"
+    }
+
+@app.get("/cloud-status")
+def cloud_status():
+
+    if LAST_CLOUD_HEARTBEAT is None:
+        return {
+            "cloud_status": "unknown"
+        }
+
+    elapsed = time.time() - LAST_CLOUD_HEARTBEAT
+
+    return {
+        "cloud_status": (
+            "alive" if elapsed < CLOUD_HEARTBEAT_TIMEOUT
+            else "unavailable"
+        ),
+        "last_heartbeat_seconds_ago": round(elapsed, 2)
+    }
