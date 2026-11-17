@@ -1,6 +1,9 @@
 from fastapi import FastAPI
 import requests
 from datetime import datetime
+from fastapi import HTTPException
+from pydantic import BaseModel
+import time
 
 app = FastAPI(title="Fog-Cloud Controller")
 
@@ -13,6 +16,14 @@ FOG_NODES = {
     # "fog_node_2": "http://192.168.43.94:8001",
     # "fog_node_3": "http://192.168.43.188:8002"
 }
+
+HEARTBEAT_TIMEOUT = 15
+NODE_HEARTBEATS = {}
+
+class Heartbeat(BaseModel):
+    node_id: str
+    timestamp: float
+    status: str
 
 
 @app.get("/")
@@ -49,3 +60,27 @@ def get_nodes():
             }
 
     return results
+
+@app.post("/heartbeat")
+def receive_heartbeat(heartbeat: Heartbeat):
+
+    NODE_HEARTBEATS[heartbeat.node_id] = {
+        "last_heartbeat": time.time(),
+        "status": heartbeat.status
+    }
+
+    print(f"[HEARTBEAT] Received from {heartbeat.node_id}")
+
+    return {
+        "message": "Heartbeat received",
+        "node_id": heartbeat.node_id
+    }
+
+def is_node_alive(node_id):
+
+    if node_id not in NODE_HEARTBEATS:
+        return False
+
+    last_seen = NODE_HEARTBEATS[node_id]["last_heartbeat"]
+
+    return (time.time() - last_seen) < HEARTBEAT_TIMEOUT
