@@ -5,6 +5,9 @@ import time
 from pydantic import BaseModel
 import requests
 import threading
+from concurrent.futures import ThreadPoolExecutor  # optional
+import traceback
+from fastapi import HTTPException
 
 app = FastAPI(
     title="Fog Worker API",
@@ -14,24 +17,35 @@ app = FastAPI(
 
 import os
 
-NODE_PORT = os.getenv("NODE_PORT", "8001")
+NODE_PORT = os.getenv("NODE_PORT", "8002")
 NODE_ID = f"{platform.node()}-{NODE_PORT}"
 
 CLOUD_NODE_URL = os.getenv(
     "CLOUD_NODE_URL",
-    "http://127.0.0.1:8000"
+    "http://127.0.0.1:8002"
 )
 
 HEARTBEAT_INTERVAL = 5
-RESOURCE_INTERVAL = 10
+RESOURCE_INTERVAL = 20
 START_TIME = time.time()
-CLOUD_HEARTBEAT_TIMEOUT = 15
+CLOUD_HEARTBEAT_TIMEOUT = 5
 LAST_CLOUD_HEARTBEAT = None
 
 class CloudHeartbeat(BaseModel):
     cloud_id: str
     timestamp: float
     status: str
+
+
+CURRENT_TASK = None          # dict describing the running/last task
+TASK_LOCK = threading.Lock()
+class TrainRequest(BaseModel):
+    task_id: str
+    model_type: str = "logistic_regression"
+    params: dict = {}
+    shard_index: int = 0     # which part of the dataset this node trains on
+    num_shards: int = 1
+
 
 
 @app.get("/")
@@ -177,3 +191,64 @@ def cloud_status():
         ),
         "last_heartbeat_seconds_ago": round(elapsed, 2)
     }
+
+def run_training(req: TrainRequest):
+    global CURRENT_TASK
+    started = time.time()
+    try:
+        from sklearn.datasets import make_classification
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.ensemble import RandomForestClassifier
+        from sklearn.model_selection import train_test_split
+
+        # Replace with your real dataset loading + sharding
+        X, y = make_classification(n_samples=20000, n_features=20, random_state=42)
+        X, y = X[req.shard_index::req.num_shards], y[req.shard_index::req.num_shards]
+        X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2)
+
+        models = {
+            "logistic_regression": LogisticRegression,
+            "random_forest": RandomForestClassifier,
+        }
+        model = models[req.model_type](**req.params)
+        model.fit(X_tr, y_tr)
+
+        result = {
+            "status": "completed",
+            "accuracy": float(model.score(X_te, y_te)),
+        }
+    except Exception as e:
+        traceback.print_exc()
+        result = {"status": "failed", "error": str(e)}
+
+    result.update({
+        "task_id": req.task_id,
+        "node_id": NODE_ID,
+        "duration_seconds": round(time.time() - started, 2),
+    })
+
+    with TASK_LOCK:
+        CURRENT_TASK = result
+
+    # report to cloud
+    try:
+        requests.post(f"{CLOUD_NODE_URL}/tasks/result", json=result, timeout=5)
+    except requests.RequestException as e:
+        print(f"[TASK RESULT ERROR] {e}")
+
+
+
+@app.post("/train", status_code=202)
+def train(req: TrainRequest):
+    global CURRENT_TASK
+    with TASK_LOCK:
+        if CURRENT_TASK and CURRENT_TASK.get("status") == "running":
+            raise HTTPException(status_code=409, detail="Node busy")
+        CURRENT_TASK = {"task_id": req.task_id, "status": "running"}
+
+    threading.Thread(target=run_training, args=(req,), daemon=True).start()
+    return {"message": "Training started", "task_id": req.task_id, "node_id": NODE_ID}
+
+@app.get("/train/status")
+def train_status():
+    return CURRENT_TASK or {"status": "idle"}
