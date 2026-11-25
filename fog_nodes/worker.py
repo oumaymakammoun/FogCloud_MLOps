@@ -1,3 +1,5 @@
+import pickle, base64
+import numpy as np
 from fastapi import FastAPI
 import psutil
 import platform
@@ -39,12 +41,19 @@ class CloudHeartbeat(BaseModel):
 
 CURRENT_TASK = None          # dict describing the running/last task
 TASK_LOCK = threading.Lock()
+
 class TrainRequest(BaseModel):
     task_id: str
-    model_type: str = "logistic_regression"
+    node_name: str
+    model_type: str = "sgd_logistic"
     params: dict = {}
-    shard_index: int = 0     # which part of the dataset this node trains on
+    shard_index: int = 0
     num_shards: int = 1
+    epochs: int = 10                      # total epochs of the whole task
+    resume_epoch: int = 0                 # last epoch already done
+    end_epoch: int | None = None          # last epoch THIS node must train
+    segment_index: int = 0
+    resume_checkpoint_b64: str | None = None
 
 
 
@@ -197,44 +206,58 @@ def run_training(req: TrainRequest):
     started = time.time()
     try:
         from sklearn.datasets import make_classification
-        from sklearn.linear_model import LogisticRegression
-        from sklearn.ensemble import RandomForestClassifier
+        from sklearn.linear_model import SGDClassifier
         from sklearn.model_selection import train_test_split
 
-        # Replace with your real dataset loading + sharding
         X, y = make_classification(n_samples=20000, n_features=20, random_state=42)
         X, y = X[req.shard_index::req.num_shards], y[req.shard_index::req.num_shards]
-        X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2)
+        X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=42)
+        classes = np.unique(y)
 
-        models = {
-            "logistic_regression": LogisticRegression,
-            "random_forest": RandomForestClassifier,
-        }
-        model = models[req.model_type](**req.params)
-        model.fit(X_tr, y_tr)
+        if req.resume_checkpoint_b64:
+            model = pickle.loads(base64.b64decode(req.resume_checkpoint_b64))
+        else:
+            model = SGDClassifier(loss="log_loss", random_state=42, **req.params)
 
-        result = {
-            "status": "completed",
-            "accuracy": float(model.score(X_te, y_te)),
-        }
+        acc = None
+        end_epoch = req.end_epoch or req.epochs
+        for epoch in range(req.resume_epoch + 1, end_epoch + 1):
+            model.partial_fit(X_tr, y_tr, classes=classes)
+            acc = float(model.score(X_te, y_te))
+
+            with TASK_LOCK:
+                CURRENT_TASK = {"task_id": req.task_id, "status": "running",
+                                "epoch": epoch, "total_epochs": req.epochs,
+                                "accuracy": acc}
+
+            send_checkpoint(req, epoch, acc, model)
+
+        result = {"status": "completed", "accuracy": acc}
     except Exception as e:
         traceback.print_exc()
         result = {"status": "failed", "error": str(e)}
 
     result.update({
         "task_id": req.task_id,
-        "node_id": NODE_ID,
+        "node_id": req.node_name,
+        "segment_index": req.segment_index,
         "duration_seconds": round(time.time() - started, 2),
     })
-
+    
     with TASK_LOCK:
         CURRENT_TASK = result
 
     # report to cloud
-    try:
-        requests.post(f"{CLOUD_NODE_URL}/tasks/result", json=result, timeout=5)
-    except requests.RequestException as e:
-        print(f"[TASK RESULT ERROR] {e}")
+        # notify cloud that training is done (with retries)
+    for attempt in range(1, 4):
+        try:
+            r = requests.post(f"{CLOUD_NODE_URL}/tasks/result", json=result, timeout=5)
+            r.raise_for_status()
+            print(f"[TRAINING DONE] Cloud notified for task {req.task_id}")
+            break
+        except requests.RequestException as e:
+            print(f"[TASK RESULT ERROR] attempt {attempt}/3: {e}")
+            time.sleep(2)
 
 
 
@@ -252,3 +275,23 @@ def train(req: TrainRequest):
 @app.get("/train/status")
 def train_status():
     return CURRENT_TASK or {"status": "idle"}
+
+def send_checkpoint(req, epoch, accuracy, model):
+    payload = {
+        "task_id": req.task_id,
+        "node_name": req.node_name,
+        "epoch": epoch,
+        "total_epochs": req.epochs,
+        "accuracy": accuracy,
+        "model_b64": base64.b64encode(pickle.dumps(model)).decode(),
+        "timestamp": time.time(),
+    }
+    for attempt in range(1, 4):
+        try:
+            r = requests.post(f"{CLOUD_NODE_URL}/checkpoints", json=payload, timeout=10)
+            r.raise_for_status()
+            return True
+        except requests.RequestException as e:
+            print(f"[CHECKPOINT ERROR] epoch {epoch} attempt {attempt}/3: {e}")
+            time.sleep(1)
+    return False   # don't kill training if the cloud is unreachable
