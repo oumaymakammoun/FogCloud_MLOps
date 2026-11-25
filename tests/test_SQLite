@@ -1,0 +1,20 @@
+python -c "
+from core.database import MLOpsDatabase
+import time
+
+db = MLOpsDatabase()
+db.register_tasks([
+    {'task_id': 'part_1', 'dataset_shard': 'data_1.csv', 'total_epochs': 5},
+    {'task_id': 'part_2', 'dataset_shard': 'data_2.csv', 'total_epochs': 5},
+])
+
+# 1. Assignation et sauvegarde d'un checkpoint à l'epoch 3
+db.assign_task('part_1', 'worker-distant-1')
+path = db.save_checkpoint_bytes('part_1', 3, b'FAKE_MODEL_WEIGHTS_EPOCH_3')
+db.update_checkpoint('part_1', 'worker-distant-1', 3, path, '{\"loss\": 0.24}')
+
+# 2. Simulation d'une panne (timeout = 0s pour tester immédiatement la récupération)
+recovered = db.recover_interrupted_tasks(stale_timeout_sec=0)
+print('Tâches récupérées par le Standby :', recovered)
+print('Contenu du checkpoint relu :', db.load_checkpoint_bytes('part_1'))
+"
