@@ -1,0 +1,36 @@
+python -c "
+import time
+from core.database import MLOpsDatabase
+from core.resilience import ResilienceManager
+
+db = MLOpsDatabase()
+rm = ResilienceManager(
+    node_id='standby-fog-8001',
+    my_lan_url='http://192.168.43.122:8001',
+    primary_cloud_id='cloud-main',
+    primary_cloud_url='http://192.168.43.122:8002',
+    peer_fog_urls=[],
+    is_standby=True,
+    db=db,
+    heartbeat_timeout=3.0,
+    required_recovery_heartbeats=3
+)
+
+rm.start()
+
+# 1. Le Cloud principal est en vie
+rm.handle_cloud_heartbeat('cloud-main', is_primary=True)
+print('Etat initial :', rm.get_status())
+
+# 2. On simule une panne de 4 secondes (> 3.0s)
+time.sleep(4.5)
+print('Etat apres panne (Failover) :', rm.get_status())
+
+# 3. Le Cloud principal redemarre et envoie 3 heartbeats
+for i in range(3):
+    rm.handle_cloud_heartbeat('cloud-main', is_primary=True)
+    time.sleep(0.5)
+
+print('Etat apres retour (Failback) :', rm.get_status())
+rm.stop()
+"
